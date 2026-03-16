@@ -1,4 +1,4 @@
-t is about 18 years since I used crewes matlab open source toolbox to help start my career in UT Austin. 
+It is about 18 years since I used crewes matlab open source toolbox to help start my career in UT Austin. 
 Crewes toolbox has a lot of nice legacy codes written by Gary Margrave and his students. I have not used 
 some part of the code for long. Today with the help of Claude.ai, it is not difficult to convert some of nice matlab 
 codes to python implementation.
