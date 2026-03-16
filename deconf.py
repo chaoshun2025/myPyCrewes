@@ -1,59 +1,46 @@
 """
 deconf.py  –  Frequency-domain (spectral) deconvolution.
 
-Ports the CREWES MATLAB function deconf.m to Python/NumPy.
-Helper utilities (padpow2, pad, convz, triangle, gaussian) are
-implemented inline so the file is self-contained.
+Direct port of the CREWES MATLAB function deconf.m (Margrave, May 1991)
+to Python/NumPy, using the companion helper modules padpow2.py, pad.py,
+convz.py, and balans.py.
+
+MATLAB source summary
+----------------------
+    N   = length(trin)          % original length before padding
+    trin    = padpow2(trin)
+    trdsign = pad(trdsign, trin)        % flag=0: match length of padded trin
+    Npad = length(trin)
+    n    = Npad * n / N                 % scale smoother for padded length
+
+    spec   = fftshift(fft(trdsign))
+    power  = real(spec)^2 + imag(spec)^2
+    mean_p = sum(power) / length(power) % arithmetic mean
+    power  = power + stab * mean_p
+
+    smoother = boxcar(2*fix(n/2)+1)     % odd-length boxcar (ones)
+    power    = convz(power, smoother)   % zero-phase (centred) convolution
+
+    if phase == 1
+        logspec = hilbert(0.5 * log(power))  % analytic signal of log-spectrum
+        specinv = exp(-conj(logspec))         % min-phase inverse
+    else
+        specinv = power ^ (-0.5)              % zero-phase whitening
+
+    specin  = fftshift(fft(trin))
+    specout = specin .* specinv
+    trout   = real(ifft(fftshift(specout)))
+    trout   = balans(trout, trin)        % RMS-match output to input
+    trout   = pad(trout, 1:N)           % truncate back to original length
 """
 
 import numpy as np
 from scipy.signal import hilbert as sp_hilbert
 
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _next_pow2(n: int) -> int:
-    return 1 << int(np.ceil(np.log2(n)))
-
-
-def _padpow2(x: np.ndarray) -> np.ndarray:
-    """Zero-pad x to the next power of 2."""
-    n = _next_pow2(len(x))
-    out = np.zeros(n, dtype=x.dtype)
-    out[:len(x)] = x
-    return out
-
-
-def _pad(x: np.ndarray, target_len: int) -> np.ndarray:
-    """Zero-pad or truncate x to target_len."""
-    if len(x) >= target_len:
-        return x[:target_len].copy()
-    out = np.zeros(target_len, dtype=x.dtype)
-    out[:len(x)] = x
-    return out
-
-
-def _convz(x: np.ndarray, h: np.ndarray) -> np.ndarray:
-    """Zero-phase (full) convolution; returns array of length len(x)."""
-    full = np.convolve(x, h, mode='full')
-    # centre the result (same as MATLAB convz which is linear conv)
-    return full[:len(x)]
-
-
-def _triangle(n: int) -> np.ndarray:
-    """Triangular window of length n (peak at centre)."""
-    half = (n + 1) // 2
-    w = np.concatenate([np.arange(1, half + 1), np.arange(half - 1, 0, -1)])
-    return w[:n].astype(float)
-
-
-def _gaussian_win(n: int) -> np.ndarray:
-    """Gaussian window of length n."""
-    sigma = n / 6.0
-    t = np.arange(n) - n // 2
-    return np.exp(-0.5 * (t / sigma) ** 2)
+from padpow2 import padpow2
+from pad import pad
+from convz import convz
+from balans import balans
 
 
 # ---------------------------------------------------------------------------
@@ -66,86 +53,127 @@ def deconf(
     n: int,
     stab: float = 1e-4,
     phase: int = 1,
-    smoother: str = 'boxcar',
 ) -> tuple[np.ndarray, np.ndarray]:
     """
-    Frequency-domain deconvolution of a seismic trace.
+    Frequency-domain (spectral) deconvolution of a seismic trace.
 
     Parameters
     ----------
-    trin : np.ndarray
-        Input trace to be deconvolved (1D).
-    trdsign : np.ndarray
-        Trace used for operator design (1D).
+    trin : array-like, 1-D
+        Input trace to be deconvolved.
+    trdsign : array-like, 1-D
+        Trace used for operator design (may differ from *trin*, e.g.
+        a windowed sub-trace).
     n : int
-        Number of points in the frequency-domain smoother.
+        Number of points in the frequency-domain **boxcar** smoother
+        (applied to the power spectrum before inversion).  Automatically
+        scaled for the padded FFT length.
     stab : float, optional
-        Stabilisation factor as a fraction of the maximum power.
+        Stabilisation factor expressed as a fraction of the **mean** power
+        of the design spectrum.  Equivalent to adding white noise.
         Default = 1e-4.
     phase : int, optional
-        0 → zero-phase whitening; 1 → minimum-phase deconvolution.
-        Default = 1.
-    smoother : str, optional
-        Smoother type: 'boxcar' (default), 'triangle', or 'gaussian'.
+        * ``1`` (default) – minimum-phase deconvolution via spectral
+          factorisation (Hilbert-transform method).
+        * ``0`` – zero-phase whitening (divide by amplitude spectrum).
 
     Returns
     -------
-    trout : np.ndarray
-        Deconvolved output trace (same length as trin).
-    specinv : np.ndarray
-        Inverse operator spectrum (complex, length = padded FFT length).
-        The time-domain operator is ``np.real(np.fft.ifft(np.fft.ifftshift(specinv)))``.
+    trout : np.ndarray, 1-D
+        Deconvolved output trace, same length as *trin*.
+    specinv : np.ndarray, 1-D (complex)
+        Inverse-operator spectrum in fftshifted order, length = padded
+        FFT size.  The time-domain operator is::
+
+            d = np.real(np.fft.ifft(np.fft.ifftshift(specinv)))
+
+        and the estimated wavelet is::
+
+            w = np.real(np.fft.ifft(1.0 / np.fft.fft(d)))
     """
-    trin = np.asarray(trin, dtype=float).ravel()
+    trin    = np.asarray(trin,    dtype=float).ravel()
     trdsign = np.asarray(trdsign, dtype=float).ravel()
-    N = len(trin)
 
-    # Pad to power of 2
-    trin_pad = _padpow2(trin)
-    trdsign_pad = _pad(trdsign, len(trin_pad))
-    Npad = len(trin_pad)
+    # ------------------------------------------------------------------
+    # 1. Pad traces to power of 2
+    #    MATLAB: trin = padpow2(trin)
+    #            trdsign = pad(trdsign, trin)   [flag=0 → end-pad]
+    # ------------------------------------------------------------------
+    N        = len(trin)
+    trin_pad = padpow2(trin)                       # power-of-2 length
+    Npad     = len(trin_pad)
+    trdsign_pad = pad(trdsign, Npad)               # match padded length
 
-    # Scale smoother length to account for padding
+    # ------------------------------------------------------------------
+    # 2. Scale smoother length for padded FFT
+    #    MATLAB: n = Npad * n / N
+    # ------------------------------------------------------------------
     n_scaled = int(Npad * n / N)
 
-    # Power spectrum of design trace
-    spec = np.fft.fftshift(np.fft.fft(trdsign_pad))
+    # ------------------------------------------------------------------
+    # 3. Power spectrum of design trace
+    #    MATLAB: spec  = fftshift(fft(trdsign))
+    #            power = real(spec)^2 + imag(spec)^2
+    # ------------------------------------------------------------------
+    spec  = np.fft.fftshift(np.fft.fft(trdsign_pad))
     power = np.real(spec) ** 2 + np.imag(spec) ** 2
 
-    # Stabilise
-    max_p = np.max(power)
-    delta_p = stab * max_p
-    power = power + delta_p
+    # ------------------------------------------------------------------
+    # 4. Stabilise: add stab * mean_power
+    #    MATLAB: mean_p = sum(power)/length(power)  [arithmetic mean]
+    #            power  = power + stab * mean_p
+    # ------------------------------------------------------------------
+    mean_p  = np.sum(power) / len(power)
+    power   = power + stab * mean_p
 
-    # Build smoother (odd length)
-    nn = 2 * (n_scaled // 2) + 1
-    if smoother == 'boxcar':
-        smoo = np.ones(nn)
-    elif smoother == 'triangle':
-        smoo = _triangle(nn)
-    elif smoother == 'gaussian':
-        smoo = _gaussian_win(nn)
-    else:
-        raise ValueError(f"Unknown smoother type: '{smoother}'")
+    # ------------------------------------------------------------------
+    # 5. Boxcar smoother (odd length) applied zero-phase
+    #    MATLAB: smoother = boxcar(2*fix(n/2)+1)
+    #            power    = convz(power, smoother)
+    #    No normalisation — convz is a plain linear convolution,
+    #    centred to keep the power spectrum aligned.
+    # ------------------------------------------------------------------
+    nn       = 2 * int(n_scaled // 2) + 1          # guaranteed odd
+    smoother = np.ones(nn, dtype=float)             # boxcar
+    # convz(r, w): nzero defaults to ceil((nw+1)/2), i.e. the centre of
+    # the boxcar — exactly the zero-phase alignment MATLAB uses.
+    # flag=0: suppress the mwindow taper (appropriate for traces, not spectra).
+    power    = convz(power, smoother, flag=0)
 
-    # Smooth the power spectrum
-    power = _convz(power, smoo) / np.sum(np.abs(smoo))
-
-    # Build inverse operator spectrum
+    # ------------------------------------------------------------------
+    # 6. Build inverse-operator spectrum
+    # ------------------------------------------------------------------
     if phase == 1:
-        # Minimum-phase: spectral factorisation via Hilbert transform
+        # Minimum-phase via spectral factorisation
+        # MATLAB: logspec = hilbert(0.5 * log(power))
+        #         specinv = exp(-conj(logspec))
         logspec = sp_hilbert(0.5 * np.log(power))
         specinv = np.exp(-np.conj(logspec))
     else:
         # Zero-phase whitening
+        # MATLAB: specinv = power ^ (-0.5)
         specinv = power ** (-0.5)
 
-    # Deconvolve
-    specin = np.fft.fftshift(np.fft.fft(trin_pad))
-    specout = specin * specinv
+    # ------------------------------------------------------------------
+    # 7. Deconvolve input trace
+    #    MATLAB: specin  = fftshift(fft(trin))
+    #            specout = specin .* specinv
+    #            trout   = real(ifft(fftshift(specout)))
+    # ------------------------------------------------------------------
+    specin   = np.fft.fftshift(np.fft.fft(trin_pad))
+    specout  = specin * specinv
     trout_pad = np.real(np.fft.ifft(np.fft.ifftshift(specout)))
 
-    # Unpad to original length
-    trout = trout_pad[:N]
+    # ------------------------------------------------------------------
+    # 8. RMS-balance output to input (MATLAB: balans)
+    #    balans(trin, trref) scales trin to match RMS of trref.
+    # ------------------------------------------------------------------
+    trout_pad = balans(trout_pad, trin_pad)
+
+    # ------------------------------------------------------------------
+    # 9. Unpad back to original length
+    #    MATLAB: trout = pad(trout, 1:N)   [flag=0 → simple truncation]
+    # ------------------------------------------------------------------
+    trout = pad(trout_pad, N)
 
     return trout, specinv
