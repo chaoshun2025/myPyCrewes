@@ -15,4 +15,4 @@ testWedgePlusAnticline.ipynb
 
 The Thrust model results are here.
 
-![alt text](https://github.com/chaoshun2025/myPyCrewes/new/main?filename=README.md#:~:text=testWedgePlusAnticline.ipynb-,thrustModelAndImage,-.jpg)
+![alt text](https://github.com/chaoshun2025/myPyCrewes/blob/main/thrustModelAndImage.jpg)
